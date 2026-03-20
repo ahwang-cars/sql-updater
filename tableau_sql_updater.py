@@ -89,6 +89,26 @@ def update_custom_sql(root: ET.Element, new_sql: str, relation_name: str | None 
     return count
 
 
+def embed_connection_credentials(root: ET.Element, username: str, password: str) -> int:
+    """
+    Embed database credentials directly in <connection> elements.
+    Sets username, password, and switches workgroup-auth-mode from 'prompt'
+    to 'username-password' so Bridge uses the embedded credentials.
+    Returns the number of connections updated.
+    """
+    count = 0
+    for conn in root.iter("connection"):
+        cls = conn.get("class", "")
+        if cls in ("federated", "hyper", ""):
+            continue
+        conn.set("username", username)
+        conn.set("password", password)
+        if conn.get("workgroup-auth-mode") == "prompt":
+            conn.set("workgroup-auth-mode", "username-password")
+        count += 1
+    return count
+
+
 def update_initial_sql(root: ET.Element, new_sql: str) -> int:
     """
     Replace the one-time-sql attribute on <connection> elements.
@@ -205,8 +225,16 @@ def download_datasource(server: TSC.Server, datasource_id: str, dest_dir: str) -
     return path
 
 
-def publish_datasource(server: TSC.Server, datasource_id: str, file_path: str):
-    """Publish the modified .tdsx back, overwriting the existing data source."""
+def publish_datasource(
+    server: TSC.Server,
+    datasource_id: str,
+    file_path: str,
+    db_username: str | None = None,
+    db_password: str | None = None,
+):
+    """Publish the modified .tdsx back, overwriting the existing data source.
+    If db_username/db_password are provided, re-apply them to all connections after publish.
+    """
     original = server.datasources.get_by_id(datasource_id)
     ds_item = TSC.DatasourceItem(project_id=original.project_id, name=original.name)
 
@@ -217,6 +245,18 @@ def publish_datasource(server: TSC.Server, datasource_id: str, file_path: str):
         mode=TSC.Server.PublishMode.Overwrite,
     )
     print(f"Published successfully. Datasource ID: {result.id}")
+
+    if db_username and db_password:
+        server.datasources.populate_connections(result)
+        updated = 0
+        for conn in result.connections:
+            conn.username = db_username
+            conn.password = db_password
+            conn.embed_password = True
+            server.datasources.update_connection(result, conn)
+            updated += 1
+        print(f"Re-applied database credentials to {updated} connection(s)")
+
     return result
 
 
@@ -242,6 +282,11 @@ def main():
     ds = parser.add_argument_group("datasource (use --datasource-name or --datasource-id)")
     ds.add_argument("--datasource-name", help="Datasource name (will look up ID automatically)")
     ds.add_argument("--datasource-id", help="Datasource UUID (faster, skips name lookup)")
+
+    # Database credentials (re-applied after publish to preserve connection)
+    db = parser.add_argument_group("database credentials (re-applied after publish)")
+    db.add_argument("--db-username", help="Database username for the datasource connection")
+    db.add_argument("--db-password", help="Database password for the datasource connection")
 
     # SQL files
     parser.add_argument("--custom-sql-file", help="Path to .sql file with new Custom SQL")
@@ -284,6 +329,16 @@ def main():
     if not token_name or not token_value:
         parser.error("Provide credentials via --config or --token-name/--token-value")
 
+    # --- Resolve database credentials ---
+    db_username = args.db_username
+    db_password = args.db_password
+
+    if args.config and (not db_username or not db_password):
+        cfg = load_config(args.config)
+        db_cfg = cfg.get("connection_credentials", {})
+        db_username = db_username or db_cfg.get("username")
+        db_password = db_password or db_cfg.get("password")
+
     # --- Validate action ---
     if not args.custom_sql_file and not args.initial_sql_file \
        and not args.inspect_only and not args.remove_initial_sql:
@@ -323,6 +378,11 @@ def main():
 
     changes_made = False
 
+    if db_username and db_password:
+        n = embed_connection_credentials(root, db_username, db_password)
+        print(f"Embedded database credentials in {n} connection(s)")
+        changes_made = n > 0
+
     if args.custom_sql_file:
         new_sql = Path(args.custom_sql_file).read_text(encoding="utf-8").strip()
         n = update_custom_sql(root, new_sql, args.relation_name)
@@ -360,7 +420,7 @@ def main():
     if args.local_tdsx:
         server = connect(server_url, site_id, token_name, token_value)
 
-    publish_datasource(server, datasource_id, modified_path)
+    publish_datasource(server, datasource_id, modified_path, db_username, db_password)
 
     if not args.output_dir:
         shutil.rmtree(tmpdir, ignore_errors=True)

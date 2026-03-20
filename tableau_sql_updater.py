@@ -15,20 +15,27 @@ Workflow:
 Requirements:
   pip install tableauserverclient
 
-Usage:
+Usage (with config file):
   python tableau_sql_updater.py \
-    --server https://us-west-2b.online.tableau.com \
-    --site cars \
+    --config config.json \
+    --datasource-name "DI 13mo Daily DigAd Summary Dealer Performance" \
+    --custom-sql-file updated_query.sql \
+    --dry-run
+
+Usage (with explicit credentials):
+  python tableau_sql_updater.py \
     --token-name "MY_PAT_NAME" \
     --token-value "MY_PAT_VALUE" \
-    --datasource-id 101217312 \
+    --datasource-id "76595187-2cbc-4f88-ba72-ba162f734bf5" \
     --custom-sql-file updated_query.sql \
-    --initial-sql-file initial_sql.sql \
     --dry-run
 """
 
+from __future__ import annotations
+
 import argparse
 import io
+import json
 import os
 import re
 import shutil
@@ -62,7 +69,6 @@ def parse_tds(zip_path: str, tds_name: str) -> tuple[ET.ElementTree, str]:
     """Extract and parse the .tds XML from a .tdsx ZIP. Returns (tree, raw_xml)."""
     with zipfile.ZipFile(zip_path, "r") as z:
         raw = z.read(tds_name)
-    # Preserve original encoding declaration
     tree = ET.ElementTree(ET.fromstring(raw))
     return tree, raw.decode("utf-8")
 
@@ -113,8 +119,7 @@ def repackage_tdsx(
     output_path: str,
 ):
     """Create a new .tdsx ZIP with the modified .tds, preserving all other files."""
-    # Write modified XML to bytes
-    buf = io.BytesIO()
+    buf = io.StringIO()
     tree.write(buf, encoding="unicode", xml_declaration=True)
     modified_tds = buf.getvalue().encode("utf-8")
 
@@ -138,14 +143,12 @@ def inspect_datasource(zip_path: str):
     print(f"  TDS file: {tds_name}")
     print(f"{'='*70}")
 
-    # Initial SQL
     for conn in root.iter("connection"):
         otsql = conn.get("one-time-sql")
         if otsql:
             print(f"\n--- Initial SQL (one-time-sql) ---")
             print(otsql[:500] + ("..." if len(otsql) > 500 else ""))
 
-    # Custom SQL relations
     for rel in root.iter("relation"):
         if rel.get("type") == "text":
             name = rel.get("name", "(unnamed)")
@@ -160,6 +163,12 @@ def inspect_datasource(zip_path: str):
 # Tableau Server Client helpers
 # ---------------------------------------------------------------------------
 
+def load_config(config_path: str) -> dict:
+    """Load credentials from a config.json file."""
+    with open(config_path) as f:
+        return json.load(f)
+
+
 def connect(server_url: str, site_id: str, token_name: str, token_value: str) -> TSC.Server:
     """Authenticate and return a connected TSC.Server instance."""
     server = TSC.Server(server_url, use_server_version=True)
@@ -169,33 +178,45 @@ def connect(server_url: str, site_id: str, token_name: str, token_value: str) ->
     return server
 
 
+def find_datasource_by_name(server: TSC.Server, name: str) -> str:
+    """Look up a datasource UUID by name. Raises if not found or ambiguous."""
+    matches = []
+    for ds in TSC.Pager(server.datasources):
+        if ds.name.lower() == name.lower():
+            matches.append(ds)
+
+    if not matches:
+        raise ValueError(f"No datasource found with name: '{name}'")
+    if len(matches) > 1:
+        options = "\n".join(f"  {ds.id}  ({ds.project_name})" for ds in matches)
+        raise ValueError(
+            f"Multiple datasources named '{name}'. Use --datasource-id with one of:\n{options}"
+        )
+    print(f"Found datasource: '{matches[0].name}' (id={matches[0].id})")
+    return matches[0].id
+
+
 def download_datasource(server: TSC.Server, datasource_id: str, dest_dir: str) -> str:
     """Download a data source as .tdsx and return the file path."""
     ds = server.datasources.get_by_id(datasource_id)
     print(f"Downloading data source: {ds.name} (id={datasource_id})")
-    path = server.datasources.download(ds.id, filepath=dest_dir, include_extract=False)
+    path = server.datasources.download(ds.id, filepath=dest_dir, include_extract=True)
     print(f"Downloaded to: {path}")
     return path
 
 
-def publish_datasource(
-    server: TSC.Server,
-    datasource_id: str,
-    file_path: str,
-):
+def publish_datasource(server: TSC.Server, datasource_id: str, file_path: str):
     """Publish the modified .tdsx back, overwriting the existing data source."""
-    # Get original datasource metadata to preserve project, name, etc.
     original = server.datasources.get_by_id(datasource_id)
     ds_item = TSC.DatasourceItem(project_id=original.project_id, name=original.name)
 
-    print(f"Publishing {file_path} as '{original.name}' (overwrite)...")
+    print(f"Publishing '{original.name}' (overwrite)...")
     result = server.datasources.publish(
         ds_item,
         file_path,
         mode=TSC.Server.PublishMode.Overwrite,
-        connection_credentials=None,
     )
-    print(f"Published successfully. New datasource ID: {result.id}")
+    print(f"Published successfully. Datasource ID: {result.id}")
     return result
 
 
@@ -207,32 +228,70 @@ def main():
     parser = argparse.ArgumentParser(
         description="Update Custom SQL and/or Initial SQL in a Tableau Online data source."
     )
-    parser.add_argument("--server", default="https://us-west-2b.online.tableau.com",
-                        help="Tableau Server URL")
-    parser.add_argument("--site", default="cars", help="Tableau site content URL")
-    parser.add_argument("--token-name", required=True, help="Personal Access Token name")
-    parser.add_argument("--token-value", required=True, help="Personal Access Token value")
-    parser.add_argument("--datasource-id", required=True, help="Data source ID to update")
 
+    # Credentials — either via config file or explicit flags
+    creds = parser.add_argument_group("credentials (use --config or explicit flags)")
+    creds.add_argument("--config", help="Path to config.json with credentials")
+    creds.add_argument("--server", default="https://us-west-2b.online.tableau.com",
+                       help="Tableau Server URL (default: cars server)")
+    creds.add_argument("--site", default="cars", help="Tableau site content URL (default: cars)")
+    creds.add_argument("--token-name", help="Personal Access Token name")
+    creds.add_argument("--token-value", help="Personal Access Token secret")
+
+    # Datasource — by name or ID
+    ds = parser.add_argument_group("datasource (use --datasource-name or --datasource-id)")
+    ds.add_argument("--datasource-name", help="Datasource name (will look up ID automatically)")
+    ds.add_argument("--datasource-id", help="Datasource UUID (faster, skips name lookup)")
+
+    # SQL files
     parser.add_argument("--custom-sql-file", help="Path to .sql file with new Custom SQL")
     parser.add_argument("--initial-sql-file", help="Path to .sql file with new Initial SQL")
-    parser.add_argument("--relation-name", help="Only update relation with this name (for Custom SQL)")
+    parser.add_argument("--relation-name", help="Only update the Custom SQL relation with this name")
     parser.add_argument("--remove-initial-sql", action="store_true",
-                        help="Remove Initial SQL instead of replacing it")
+                        help="Remove Initial SQL entirely")
 
+    # Run modes
     parser.add_argument("--inspect-only", action="store_true",
-                        help="Download and inspect without modifying")
+                        help="Download and show current SQL without modifying")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Download, modify locally, and inspect — but do NOT publish back")
-    parser.add_argument("--output-dir", help="Directory to save the modified .tdsx (optional)")
+                        help="Modify locally but do NOT publish back")
+    parser.add_argument("--output-dir", help="Save modified .tdsx to this directory")
     parser.add_argument("--local-tdsx", help="Use a local .tdsx file instead of downloading")
 
     args = parser.parse_args()
 
+    # --- Resolve credentials ---
+    token_name = args.token_name
+    token_value = args.token_value
+    server_url = args.server
+    site_id = args.site
+
+    if args.config:
+        cfg = load_config(args.config)
+        # Look for a matching site section, fall back to tableau_server
+        site_cfg = None
+        for key, val in cfg.items():
+            if isinstance(val, dict) and val.get("site_id") == site_id:
+                site_cfg = val
+                break
+        if site_cfg is None:
+            site_cfg = cfg.get("tableau_server", {})
+
+        token_name = token_name or site_cfg.get("token_name")
+        token_value = token_value or site_cfg.get("token_secret")
+        server_url = server_url or site_cfg.get("server_url", "https://us-west-2b.online.tableau.com")
+
+    if not token_name or not token_value:
+        parser.error("Provide credentials via --config or --token-name/--token-value")
+
+    # --- Validate action ---
     if not args.custom_sql_file and not args.initial_sql_file \
        and not args.inspect_only and not args.remove_initial_sql:
         parser.error("Provide at least one of: --custom-sql-file, --initial-sql-file, "
-                      "--remove-initial-sql, or --inspect-only")
+                     "--remove-initial-sql, or --inspect-only")
+
+    if not args.datasource_name and not args.datasource_id and not args.local_tdsx:
+        parser.error("Provide --datasource-name, --datasource-id, or --local-tdsx")
 
     # --- Step 1: Get the .tdsx ---
     tmpdir = tempfile.mkdtemp(prefix="tableau_sql_")
@@ -240,11 +299,19 @@ def main():
     if args.local_tdsx:
         tdsx_path = args.local_tdsx
         print(f"Using local file: {tdsx_path}")
+        server = None
+        datasource_id = args.datasource_id
     else:
-        server = connect(args.server, args.site, args.token_name, args.token_value)
-        tdsx_path = download_datasource(server, args.datasource_id, tmpdir)
+        server = connect(server_url, site_id, token_name, token_value)
 
-    # --- Step 2: Inspect ---
+        # Resolve datasource ID from name if needed
+        datasource_id = args.datasource_id
+        if not datasource_id:
+            datasource_id = find_datasource_by_name(server, args.datasource_name)
+
+        tdsx_path = download_datasource(server, datasource_id, tmpdir)
+
+    # --- Step 2: Inspect only ---
     if args.inspect_only:
         inspect_datasource(tdsx_path)
         return
@@ -257,18 +324,8 @@ def main():
     changes_made = False
 
     if args.custom_sql_file:
-        new_sql = Path(args.custom_sql_file).read_text(encoding="utf-8")
-        # Split out initial SQL if file starts with the marker
-        custom_sql = new_sql
-        initial_sql_from_file = None
-
-        marker = "--## This file contains Initial SQL ##--"
-        if marker in new_sql:
-            # Everything before the first CTE/SELECT after the marker is initial SQL
-            # For now, treat the entire file as custom SQL and let --initial-sql-file handle initial SQL
-            pass
-
-        n = update_custom_sql(root, custom_sql.strip(), args.relation_name)
+        new_sql = Path(args.custom_sql_file).read_text(encoding="utf-8").strip()
+        n = update_custom_sql(root, new_sql, args.relation_name)
         print(f"Updated {n} Custom SQL relation(s)")
         changes_made = n > 0
 
@@ -287,13 +344,12 @@ def main():
         print("WARNING: No changes were applied. Check your arguments.")
         return
 
-    # --- Step 4: Repackage ---
+    # --- Step 4: Repackage as .tdsx ---
     output_dir = args.output_dir or tmpdir
     modified_path = os.path.join(output_dir, f"modified_{os.path.basename(tdsx_path)}")
     repackage_tdsx(tdsx_path, tds_name, tree, modified_path)
     print(f"Modified .tdsx saved to: {modified_path}")
 
-    # Show what the updated file looks like
     inspect_datasource(modified_path)
 
     # --- Step 5: Publish (unless dry-run) ---
@@ -302,15 +358,14 @@ def main():
         return
 
     if args.local_tdsx:
-        server = connect(args.server, args.site, args.token_name, args.token_value)
+        server = connect(server_url, site_id, token_name, token_value)
 
-    publish_datasource(server, args.datasource_id, modified_path)
+    publish_datasource(server, datasource_id, modified_path)
 
-    # Cleanup
     if not args.output_dir:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    if not args.local_tdsx:
+    if server:
         server.auth.sign_out()
 
     print("Done!")

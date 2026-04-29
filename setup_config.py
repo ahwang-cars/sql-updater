@@ -33,7 +33,11 @@ def prompt(label, *, default=None, secret=False, allow_empty=False):
 
 def main():
     if CONFIG_PATH.exists():
-        ans = input(f"{CONFIG_PATH.name} already exists. Overwrite? [y/N]: ").strip().lower()
+        try:
+            ans = input(f"{CONFIG_PATH.name} already exists. Overwrite? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(1)
         if ans != "y":
             print("Aborted.")
             sys.exit(0)

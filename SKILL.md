@@ -17,27 +17,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Then create `config.json` in the repo root (gitignored) with Tableau PATs for each site you need:
+Then run the setup script — it prompts for your Tableau PAT(s) and Redshift creds and writes `config.json` (gitignored, mode 600) in the repo root:
 
-```json
-{
-  "tableau_server": {
-    "server_url": "https://us-west-2b.online.tableau.com",
-    "site_id": "dealertools",
-    "token_name": "<your_pat_name>",
-    "token_secret": "<your_pat_secret>"
-  },
-  "cars_site": {
-    "site_id": "cars",
-    "token_name": "<your_pat_name>",
-    "token_secret": "<your_pat_secret>"
-  },
-  "connection_credentials": {
-    "username": "<redshift_user>",
-    "password": "<redshift_password>"
-  }
-}
+```bash
+python setup_config.py
 ```
+
+You'll need:
+- A Tableau Personal Access Token for the `cars` site (and optionally `dealertools`). Create one at `https://us-west-2b.online.tableau.com` → My Account Settings → Personal Access Tokens.
+- The Redshift username and password used by the Tableau datasource connections (ask the team if you don't have these).
 
 For each new terminal session, activate the venv: `source venv/bin/activate`.
 
